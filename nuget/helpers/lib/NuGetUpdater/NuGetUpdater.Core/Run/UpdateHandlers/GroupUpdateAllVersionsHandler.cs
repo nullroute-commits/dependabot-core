@@ -1,7 +1,6 @@
 using System.Collections.Immutable;
 
-using NuGet.Versioning;
-
+using NuGetUpdater.Core.Discover;
 using NuGetUpdater.Core.Run.ApiModel;
 using NuGetUpdater.Core.Updater;
 
@@ -175,6 +174,8 @@ internal class GroupUpdateAllVersionsHandler : IUpdateHandler
         var repoContentsPath = caseInsensitiveRepoContentsPath ?? originalRepoContentsPath;
         foreach (var directory in job.GetAllDirectories())
         {
+            var pullRequestMessages = new List<CreatePullRequest>();
+
             var discoveryResult = await discoveryWorker.RunAsync(repoContentsPath.FullName, directory);
             logger.ReportDiscovery(discoveryResult);
             if (discoveryResult.Error is not null)
@@ -183,86 +184,105 @@ internal class GroupUpdateAllVersionsHandler : IUpdateHandler
                 return;
             }
 
-            var tracker = new ModifiedFilesTracker(originalRepoContentsPath, logger);
-            await tracker.StartTrackingAsync(discoveryResult);
-
             var updatedDependencyList = RunWorker.GetUpdatedDependencyListFromDiscovery(discoveryResult, originalRepoContentsPath.FullName, logger);
             await apiHandler.UpdateDependencyList(updatedDependencyList);
 
-            var updateOperationsPerformed = new List<UpdateOperationBase>();
-            var updatedDependencies = new List<ReportedDependency>();
-            var updateOperationsToPerform = RunWorker.GetUpdateOperations(discoveryResult).ToArray();
-            foreach (var (projectPath, dependency) in updateOperationsToPerform)
+            var updateOperationsToPerformByDependency = GroupUpdateOperationsByDependency(discoveryResult);
+            foreach (var sameDependencySet in updateOperationsToPerformByDependency)
             {
-                if (!job.IsUpdatePermitted(dependency))
+                logger.Info($"Starting dependency update for {sameDependencySet.Key}");
+                var updateOperationsPerformed = new List<UpdateOperationBase>();
+                var updatedDependencies = new List<ReportedDependency>();
+                var tracker = new ModifiedFilesTracker(originalRepoContentsPath, logger);
+                await tracker.StartTrackingAsync(discoveryResult);
+
+                foreach (var (projectPath, dependency) in sameDependencySet)
                 {
-                    continue;
+                    if (!job.IsUpdatePermitted(dependency))
+                    {
+                        continue;
+                    }
+
+                    if (job.IsDependencyIgnoredByNameOnly(dependency.Name))
+                    {
+                        logger.Info($"Skipping ignored dependency {dependency.Name}.");
+                        continue;
+                    }
+
+                    var dependencyInfo = RunWorker.GetDependencyInfo(job, dependency, allowCooldown: experimentsManager.EnableCooldown);
+                    var analysisResult = await analyzeWorker.RunAsync(repoContentsPath.FullName, discoveryResult, dependencyInfo);
+                    if (analysisResult.Error is not null)
+                    {
+                        logger.Error($"Error analyzing {dependency.Name} in {projectPath}: {analysisResult.Error.GetReport()}");
+                        await apiHandler.RecordUpdateJobError(analysisResult.Error, logger);
+                        return;
+                    }
+
+                    if (!analysisResult.CanUpdate)
+                    {
+                        logger.Info($"No updatable version found for {dependency.Name} in {projectPath}.");
+                        continue;
+                    }
+
+                    var projectDiscovery = discoveryResult.GetProjectDiscoveryFromPath(projectPath);
+                    var updaterResult = await updaterWorker.RunAsync(repoContentsPath.FullName, projectPath, dependency.Name, dependency.Version!, analysisResult.UpdatedVersion, dependency.IsTransitive);
+                    if (updaterResult.Error is not null)
+                    {
+                        await apiHandler.RecordUpdateJobError(updaterResult.Error, logger);
+                        continue;
+                    }
+
+                    if (updaterResult.UpdateOperations.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    var patchedUpdateOperations = RunWorker.PatchInOldVersions(updaterResult.UpdateOperations, projectDiscovery);
+                    var updatedDependenciesForThis = patchedUpdateOperations
+                        .Select(o => o.ToReportedDependency(projectPath, updatedDependencyList.Dependencies, analysisResult.UpdatedDependencies))
+                        .ToArray();
+
+                    updatedDependencies.AddRange(updatedDependenciesForThis);
+                    updateOperationsPerformed.AddRange(patchedUpdateOperations);
+                    foreach (var o in patchedUpdateOperations)
+                    {
+                        logger.Info($"Update operation performed: {o.GetReport(includeFileNames: true)}");
+                    }
                 }
 
-                if (job.IsDependencyIgnoredByNameOnly(dependency.Name))
+                var updatedDependencyFiles = await tracker.StopTrackingAsync(restoreOriginalContents: true);
+                if (updateOperationsPerformed.Count > 0)
                 {
-                    logger.Info($"Skipping ignored dependency {dependency.Name}.");
-                    continue;
-                }
-
-                var dependencyInfo = RunWorker.GetDependencyInfo(job, dependency, allowCooldown: experimentsManager.EnableCooldown);
-                var analysisResult = await analyzeWorker.RunAsync(repoContentsPath.FullName, discoveryResult, dependencyInfo);
-                if (analysisResult.Error is not null)
-                {
-                    logger.Error($"Error analyzing {dependency.Name} in {projectPath}: {analysisResult.Error.GetReport()}");
-                    await apiHandler.RecordUpdateJobError(analysisResult.Error, logger);
-                    return;
-                }
-
-                if (!analysisResult.CanUpdate)
-                {
-                    logger.Info($"No updatable version found for {dependency.Name} in {projectPath}.");
-                    continue;
-                }
-
-                var projectDiscovery = discoveryResult.GetProjectDiscoveryFromPath(projectPath);
-                var updaterResult = await updaterWorker.RunAsync(repoContentsPath.FullName, projectPath, dependency.Name, dependency.Version!, analysisResult.UpdatedVersion, dependency.IsTransitive);
-                if (updaterResult.Error is not null)
-                {
-                    await apiHandler.RecordUpdateJobError(updaterResult.Error, logger);
-                    continue;
-                }
-
-                if (updaterResult.UpdateOperations.Length == 0)
-                {
-                    continue;
-                }
-
-                var patchedUpdateOperations = RunWorker.PatchInOldVersions(updaterResult.UpdateOperations, projectDiscovery);
-                var updatedDependenciesForThis = patchedUpdateOperations
-                    .Select(o => o.ToReportedDependency(projectPath, updatedDependencyList.Dependencies, analysisResult.UpdatedDependencies))
-                    .ToArray();
-
-                updatedDependencies.AddRange(updatedDependenciesForThis);
-                updateOperationsPerformed.AddRange(patchedUpdateOperations);
-                foreach (var o in patchedUpdateOperations)
-                {
-                    logger.Info($"Update operation performed: {o.GetReport(includeFileNames: true)}");
+                    var commitMessage = PullRequestTextGenerator.GetPullRequestCommitMessage(job, [.. updateOperationsPerformed], null);
+                    var prTitle = PullRequestTextGenerator.GetPullRequestTitle(job, [.. updateOperationsPerformed], null);
+                    var prBody = await PullRequestTextGenerator.GetPullRequestBodyAsync(job, [.. updateOperationsPerformed], [.. updatedDependencies], experimentsManager);
+                    pullRequestMessages.Add(new CreatePullRequest()
+                    {
+                        Dependencies = [.. updatedDependencies],
+                        UpdatedDependencyFiles = [.. updatedDependencyFiles],
+                        BaseCommitSha = baseCommitSha,
+                        CommitMessage = commitMessage,
+                        PrTitle = prTitle,
+                        PrBody = prBody,
+                        DependencyGroup = null,
+                    });
                 }
             }
 
-            var updatedDependencyFiles = await tracker.StopTrackingAsync();
-            if (updateOperationsPerformed.Count > 0)
+            var dedupedPullRequestMessages = CreatePullRequest.FoldPullRequestMessages([.. pullRequestMessages]);
+            foreach (var pullRequestMessage in dedupedPullRequestMessages)
             {
-                var commitMessage = PullRequestTextGenerator.GetPullRequestCommitMessage(job, [.. updateOperationsPerformed], null);
-                var prTitle = PullRequestTextGenerator.GetPullRequestTitle(job, [.. updateOperationsPerformed], null);
-                var prBody = await PullRequestTextGenerator.GetPullRequestBodyAsync(job, [.. updateOperationsPerformed], [.. updatedDependencies], experimentsManager);
-                await apiHandler.CreatePullRequest(new CreatePullRequest()
-                {
-                    Dependencies = [.. updatedDependencies],
-                    UpdatedDependencyFiles = [.. updatedDependencyFiles],
-                    BaseCommitSha = baseCommitSha,
-                    CommitMessage = commitMessage,
-                    PrTitle = prTitle,
-                    PrBody = prBody,
-                    DependencyGroup = null,
-                });
+                await apiHandler.CreatePullRequest(pullRequestMessage);
             }
         }
+    }
+
+    internal static ImmutableArray<IGrouping<string, (string ProjectPath, Dependency Dependency)>> GroupUpdateOperationsByDependency(WorkspaceDiscoveryResult discoveryResult)
+    {
+        var updateOperationsToPerform = RunWorker.GetUpdateOperations(discoveryResult).ToArray();
+        var updateOperationsToPerformByDependency = updateOperationsToPerform
+            .GroupBy(o => $"{o.Dependency.Name}/{o.Dependency.Version}".ToLowerInvariant())
+            .ToImmutableArray();
+        return updateOperationsToPerformByDependency;
     }
 }
