@@ -68,6 +68,10 @@ module Dependabot
           ENV["GOENV"] = go_env_path
         end
 
+        # Set GOPRIVATE from options if provided and not already set in go.env
+        goprivate = options.fetch(:goprivate, "*")
+        ENV["GOPRIVATE"] = goprivate if goprivate && (!go_env || !T.must(go_env).content&.include?("GOPRIVATE"))
+
         # We set the GOPROXY environment variable if there are any
         # goproxy_server credentials, from here the Go toolchain will
         # use the configured proxy to fetch dependencies.

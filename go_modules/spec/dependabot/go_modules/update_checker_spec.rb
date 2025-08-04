@@ -8,6 +8,11 @@ require "dependabot/go_modules/update_checker"
 require_common_spec "update_checkers/shared_examples_for_update_checkers"
 
 RSpec.describe Dependabot::GoModules::UpdateChecker do
+  after do
+    # Always clean up GOPRIVATE after each test
+    ENV.delete("GOPRIVATE")
+  end
+
   let(:dependency_files) do
     [
       Dependabot::DependencyFile.new(
@@ -56,6 +61,11 @@ RSpec.describe Dependabot::GoModules::UpdateChecker do
   it_behaves_like "an update checker"
 
   describe "#latest_resolvable_version" do
+    before do
+      # Set GOPRIVATE for version resolution tests
+      ENV["GOPRIVATE"] = "github.com/dependabot-fixtures"
+    end
+
     subject(:latest_resolvable_version) { checker.latest_resolvable_version }
 
     context "when a supported newer version is available" do
@@ -81,6 +91,11 @@ RSpec.describe Dependabot::GoModules::UpdateChecker do
   end
 
   describe "#lowest_security_fix_version" do
+    before do
+      # Set GOPRIVATE for version resolution tests
+      ENV["GOPRIVATE"] = "github.com/dependabot-fixtures"
+    end
+
     subject(:lowest_security_fix_version) { checker.lowest_security_fix_version }
 
     let(:dependency_version) { "1.0.1" }
@@ -103,6 +118,11 @@ RSpec.describe Dependabot::GoModules::UpdateChecker do
   end
 
   describe "#lowest_resolvable_security_fix_version" do
+    before do
+      # Set GOPRIVATE for version resolution tests
+      ENV["GOPRIVATE"] = "github.com/dependabot-fixtures"
+    end
+
     subject(:lowest_resolvable_security_fix_version) { checker.lowest_resolvable_security_fix_version }
 
     let(:dependency_version) { "1.0.1" }
@@ -190,6 +210,11 @@ RSpec.describe Dependabot::GoModules::UpdateChecker do
   end
 
   describe "with cooldown options" do
+    before do
+      # Set GOPRIVATE for version resolution tests
+      ENV["GOPRIVATE"] = "github.com/dependabot-fixtures"
+    end
+
     subject(:latest_resolvable_version) { checker.latest_resolvable_version }
 
     let(:expected_cooldown_options) do

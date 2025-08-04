@@ -5,8 +5,14 @@ require "spec_helper"
 require "dependabot/dependency"
 require "dependabot/dependency_file"
 require "dependabot/go_modules/file_updater/go_mod_updater"
+require "dependabot/go_modules/file_parser"
 
 RSpec.describe Dependabot::GoModules::FileUpdater::GoModUpdater do
+  # Ensure GOPRIVATE is cleaned up after every test
+  after do
+    ENV.delete("GOPRIVATE")
+  end
+
   let(:updater) do
     described_class.new(
       dependencies: [dependency],
@@ -14,7 +20,7 @@ RSpec.describe Dependabot::GoModules::FileUpdater::GoModUpdater do
       credentials: credentials,
       repo_contents_path: repo_contents_path,
       directory: directory,
-      options: { tidy: tidy, vendor: false, goprivate: goprivate }
+      options: { tidy: tidy, vendor: false }
     )
   end
 
@@ -23,7 +29,6 @@ RSpec.describe Dependabot::GoModules::FileUpdater::GoModUpdater do
   let(:go_mod_content) { fixture("projects", project_name, "go.mod") }
   let(:tidy) { true }
   let(:directory) { "/" }
-  let(:goprivate) { "*" }
   let(:dependency_files) { [] }
 
   let(:credentials) { [] }
@@ -121,13 +126,13 @@ RSpec.describe Dependabot::GoModules::FileUpdater::GoModUpdater do
         end
 
         context "with an unrestricted goprivate" do
-          let(:goprivate) { "" }
+          before { ENV["GOPRIVATE"] = "" }
 
           it { is_expected.to include(%(rsc.io/quote v1.5.2\n)) }
         end
 
         context "with an org specific goprivate" do
-          let(:goprivate) { "rsc.io/*" }
+          before { ENV["GOPRIVATE"] = "rsc.io/*" }
 
           it { is_expected.to include(%(rsc.io/quote v1.5.2\n)) }
         end
@@ -409,8 +414,7 @@ RSpec.describe Dependabot::GoModules::FileUpdater::GoModUpdater do
 
       before do
         allow(Open3).to receive(:capture3).and_call_original
-        allow(Open3).to receive(:capture3).with(anything,
-                                                "go get github.com/spf13/viper@v1.7.1").and_return(["", stderr,
+        allow(Open3).to receive(:capture3).with("go get github.com/spf13/viper@v1.7.1").and_return(["", stderr,
                                                                                                     exit_status])
       end
 
@@ -571,6 +575,8 @@ RSpec.describe Dependabot::GoModules::FileUpdater::GoModUpdater do
     end
 
     context "when dealing with a invalid pseudo version" do
+      before { ENV["GOPRIVATE"] = "github.com/openshift/api" }
+      
       let(:project_name) { "invalid_pseudo_version" }
       let(:dependency_name) do
         "rsc.io/quote"
@@ -664,7 +670,9 @@ RSpec.describe Dependabot::GoModules::FileUpdater::GoModUpdater do
       end
 
       context "with an unrestricted goprivate" do
-        let(:goprivate) { "" }
+        before do
+          ENV["GOPRIVATE"] = ""
+        end
 
         it "raises the correct error" do
           expect { updater.updated_go_sum_content }
@@ -673,7 +681,9 @@ RSpec.describe Dependabot::GoModules::FileUpdater::GoModUpdater do
       end
 
       context "with an org specific goprivate" do
-        let(:goprivate) { "github.com/dependabot-fixtures/*" }
+        before do
+          ENV["GOPRIVATE"] = "github.com/dependabot-fixtures/*"
+        end
 
         it "raises the correct error" do
           expect { updater.updated_go_sum_content }
